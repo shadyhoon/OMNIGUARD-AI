@@ -1,0 +1,667 @@
+"""
+OmniGuard AI - Streamlit dashboard
+=================================
+A real-time multimodal verification dashboard with a dark,
+ultra-modern UI.
+
+Run with:
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+
+import plotly.graph_objects as go
+import streamlit as st
+
+from dotenv import load_dotenv
+
+from utils.verifier import analyze_content
+from utils.llm import is_llm_available, llm_enrich_report, probe_llm_health
+
+# Load .env at startup (no-op if file is absent or empty).
+load_dotenv()
+
+
+# =====================================================================
+# Page configuration
+# =====================================================================
+st.set_page_config(
+    page_title="OmniGuard AI · Verification Dashboard",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# =====================================================================
+# Theme + custom CSS
+# =====================================================================
+def _inject_theme_css() -> None:
+    """
+    Inject a dark, ultra-modern stylesheet into the Streamlit app.
+
+    The CSS targets the standard Streamlit class names. We use the
+    ``st.markdown`` trick with ``unsafe_allow_html=True`` because
+    Streamlit does not expose a native dark-theme API.
+    """
+    st.markdown(
+        """
+        <style>
+        /* ---- Global background + typography ---- */
+        .stApp {
+            background: radial-gradient(
+                    1200px 600px at 10% -10%,
+                    rgba(99, 102, 241, 0.15),
+                    transparent 60%
+                ),
+                radial-gradient(
+                    900px 500px at 100% 0%,
+                    rgba(16, 185, 129, 0.10),
+                    transparent 60%
+                ),
+                #0b0f17;
+            color: #e6edf3;
+        }
+        html, body, [class*="css"]  {
+            font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        }
+
+        /* ---- Sidebar ---- */
+        section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #0d1320 0%, #0a0f1a 100%);
+            border-right: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        section[data-testid="stSidebar"] .stMarkdown h1,
+        section[data-testid="stSidebar"] .stMarkdown h2,
+        section[data-testid="stSidebar"] .stMarkdown h3 {
+            color: #f1f5f9;
+        }
+
+        /* ---- Headings ---- */
+        h1, h2, h3, h4 {
+            color: #f8fafc !important;
+            letter-spacing: -0.01em;
+        }
+        h1 {
+            background: linear-gradient(90deg, #a5b4fc 0%, #6ee7b7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 800;
+        }
+
+        /* ---- Cards / containers ---- */
+        .og-card {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            padding: 20px 22px;
+            margin: 8px 0 18px 0;
+            backdrop-filter: blur(8px);
+        }
+        .og-card-title {
+            color: #94a3b8;
+            font-size: 0.78rem;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            margin-bottom: 10px;
+        }
+
+        /* ---- Status badges ---- */
+        .og-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin: 4px 6px 4px 0;
+            border: 1px solid transparent;
+        }
+        .og-badge.success {
+            background: rgba(16, 185, 129, 0.12);
+            color: #6ee7b7;
+            border-color: rgba(16, 185, 129, 0.35);
+        }
+        .og-badge.warning {
+            background: rgba(245, 158, 11, 0.12);
+            color: #fbbf24;
+            border-color: rgba(245, 158, 11, 0.35);
+        }
+        .og-badge.danger {
+            background: rgba(239, 68, 68, 0.12);
+            color: #fca5a5;
+            border-color: rgba(239, 68, 68, 0.35);
+        }
+        .og-badge.neutral {
+            background: rgba(148, 163, 184, 0.10);
+            color: #cbd5e1;
+            border-color: rgba(148, 163, 184, 0.25);
+        }
+        .og-badge .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            box-shadow: 0 0 8px currentColor;
+        }
+
+        /* ---- Buttons ---- */
+        .stButton > button {
+            background: linear-gradient(90deg, #6366f1 0%, #10b981 100%);
+            color: white;
+            border: 0;
+            border-radius: 12px;
+            padding: 0.7rem 1.2rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            box-shadow: 0 8px 24px rgba(99, 102, 241, 0.25);
+        }
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 12px 30px rgba(16, 185, 129, 0.30);
+        }
+
+        /* ---- Inputs ---- */
+        .stTextInput input,
+        .stTextArea textarea {
+            background: rgba(255, 255, 255, 0.04) !important;
+            border: 1px solid rgba(255, 255, 255, 0.10) !important;
+            border-radius: 12px !important;
+            color: #e6edf3 !important;
+        }
+        .stTextInput input:focus,
+        .stTextArea textarea:focus {
+            border-color: #6366f1 !important;
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25) !important;
+        }
+
+        /* ---- Radio pills (content-type toggle) ---- */
+        div[role="radiogroup"] {
+            gap: 0.5rem;
+        }
+        div[role="radiogroup"] label {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            padding: 8px 14px;
+            transition: all 0.15s ease;
+        }
+        div[role="radiogroup"] label:hover {
+            background: rgba(99, 102, 241, 0.10);
+            border-color: rgba(99, 102, 241, 0.40);
+        }
+
+        /* ---- Expander ---- */
+        .streamlit-expanderHeader {
+            background: rgba(255, 255, 255, 0.03) !important;
+            border-radius: 10px !important;
+            border: 1px solid rgba(255, 255, 255, 0.06) !important;
+        }
+
+        /* ---- Hide Streamlit chrome we don't need ---- */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header[data-testid="stHeader"] {
+            background: transparent;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =====================================================================
+# Backend mapping: UI toggle -> analyze_content() content_type
+# =====================================================================
+CONTENT_TYPE_OPTIONS: List[Tuple[str, str]] = [
+    ("🎬  Video Link", "url"),
+    ("📰  Text Article", "text"),
+    ("🧵  Social Media Thread", "text"),
+]
+
+CONTENT_TYPE_PROMPTS: Dict[str, str] = {
+    "url": "Paste the video page URL (e.g. a YouTube / Vimeo watch page):",
+    "text": "Paste the article body, or a single claim to verify:",
+    "text": "Paste the social-media thread. One post per line works best:",
+}
+# The "Social" and "Text" entries above collide; rebuild explicitly.
+CONTENT_TYPE_PROMPTS = {
+    "url": "Paste the video page URL (e.g. a YouTube / Vimeo watch page):",
+    "text_article": "Paste the article body, or a single claim to verify:",
+    "text_social": "Paste the social-media thread. One post per line works best:",
+}
+
+
+# =====================================================================
+# Cached pipeline
+# =====================================================================
+@st.cache_data(show_spinner=False)
+def _run_analysis(content_type: str, user_input: str) -> Dict[str, Any]:
+    """
+    Run the heuristic pipeline. Results are cached per
+    (content_type, input) pair so the UI doesn't re-run on every
+    widget interaction.
+    """
+    return analyze_content(content_type, user_input)
+
+
+# =====================================================================
+# Visualisation helpers
+# =====================================================================
+def _score_color(score: int) -> str:
+    """Map a 0-100 veracity score to a hex colour."""
+    if score >= 75:
+        return "#10b981"  # emerald
+    if score >= 50:
+        return "#f59e0b"  # amber
+    return "#ef4444"      # red
+
+
+def _veracity_donut(score: int) -> go.Figure:
+    """Build a Plotly donut chart for the veracity score."""
+    colour = _score_color(score)
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                values=[score, max(0, 100 - score)],
+                hole=0.72,
+                sort=False,
+                direction="clockwise",
+                marker=dict(
+                    colors=[colour, "rgba(255,255,255,0.06)"],
+                    line=dict(color="rgba(0,0,0,0)", width=0),
+                ),
+                textinfo="none",
+                hoverinfo="skip",
+            )
+        ]
+    )
+    fig.add_annotation(
+        text=f"<b>{score}</b>",
+        x=0.5, y=0.55,
+        xref="paper", yref="paper",
+        showarrow=False,
+        font=dict(size=44, color="#f8fafc", family="Inter"),
+    )
+    fig.add_annotation(
+        text="VERACITY",
+        x=0.5, y=0.40,
+        xref="paper", yref="paper",
+        showarrow=False,
+        font=dict(size=11, color="#94a3b8", family="Inter"),
+    )
+    fig.update_layout(
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=280,
+    )
+    return fig
+
+
+def _band_from_pct(pct: float | None, higher_is_better: bool = True) -> Tuple[str, str]:
+    """
+    Convert a 0-100 percentage to a (badge_label, badge_class) tuple.
+
+    ``higher_is_better=True`` (default) treats high values as good.
+    For anomaly scores pass ``higher_is_better=False`` so the
+    threshold direction is inverted.
+    """
+    if pct is None:
+        return "N/A", "neutral"
+    if higher_is_better:
+        if pct >= 75:
+            return "Good", "success"
+        if pct >= 50:
+            return "Watch", "warning"
+        return "Risk", "danger"
+    # Lower is better
+    if pct <= 25:
+        return "Good", "success"
+    if pct <= 50:
+        return "Watch", "warning"
+    return "Risk", "danger"
+
+
+def _badge(label: str, kind: str) -> str:
+    """Render a single status badge as raw HTML."""
+    return (
+        f'<span class="og-badge {kind}">'
+        f'<span class="dot"></span>{label}</span>'
+    )
+
+
+def _badge_row(mm: Dict[str, Any]) -> str:
+    """
+    Build the multimodal-consistency badge row HTML.
+
+    For text-only inputs the backend reports ``applicable=False``;
+    we render a single neutral "Not applicable" badge in that case.
+    """
+    if not mm.get("applicable"):
+        return _badge("Not applicable for this content", "neutral")
+
+    parts: List[str] = []
+
+    av = mm.get("audio_visual_alignment_pct")
+    if av is not None:
+        label, kind = _band_from_pct(av, higher_is_better=True)
+        parts.append(_badge(f"Audio/Visual alignment: {label} ({av:.0f}%)", kind))
+
+    light = mm.get("lighting_anomaly_pct")
+    if light is not None:
+        # Backend already inverted: high = clean, low = anomalous.
+        label, kind = _band_from_pct(light, higher_is_better=True)
+        parts.append(_badge(f"Lighting consistency: {label} ({light:.0f}%)", kind))
+
+    artifact = mm.get("artifact_score_pct")
+    if artifact is not None:
+        label, kind = _band_from_pct(artifact, higher_is_better=True)
+        parts.append(_badge(f"Artifact cleanliness: {label} ({artifact:.0f}%)", kind))
+
+    return " ".join(parts) if parts else _badge("No multimodal signals", "neutral")
+
+
+# =====================================================================
+# Report renderer
+# =====================================================================
+def _render_cross_ref(results: List[Dict[str, Any]]) -> None:
+    """Render cross-reference hits inside expanders.
+
+    Each hit may carry a ``relevance`` score (0.0-1.0). We surface
+    it as a coloured chip so the user can tell at a glance which
+    matches are about the page's main topic vs incidental mentions
+    pulled from nav/sidebar/comment text.
+    """
+    if not results:
+        st.info("No cross-reference hits.")
+        return
+    for i, hit in enumerate(results, 1):
+        status = (hit.get("status") or "").lower()
+        if status == "confirmed":
+            icon = "✅"
+        elif status == "false":
+            icon = "❌"
+        elif status == "error":
+            icon = "⚠️"
+        else:
+            icon = "ℹ️"
+
+        relevance = hit.get("relevance")
+        rel_pct = (
+            f"{relevance * 100:.0f}%" if isinstance(relevance, (int, float)) else "—"
+        )
+        if isinstance(relevance, (int, float)):
+            if relevance >= 0.6:
+                rel_kind, rel_icon = "success", "●"
+            elif relevance >= 0.3:
+                rel_kind, rel_icon = "warning", "●"
+            else:
+                rel_kind, rel_icon = "danger", "●"
+        else:
+            rel_kind, rel_icon = "neutral", "○"
+
+        title = (
+            f"{icon} {hit.get('claim', '(no claim)')} — "
+            f"{status.title()} · relevance {rel_pct}"
+        )
+        with st.expander(title, expanded=(i == 1 and status != "neutral")):
+            st.markdown(
+                f"**Source:** {hit.get('source', 'n/a')}\n\n"
+                f"**Summary:** {hit.get('summary', 'n/a')}"
+            )
+            # Relevance chip in the body too, with a one-line explanation
+            chip = (
+                f'<span class="og-badge {rel_kind}">'
+                f'<span class="dot"></span>'
+                f"Relevance: {rel_pct}</span>"
+            )
+            st.markdown(chip, unsafe_allow_html=True)
+            if isinstance(relevance, (int, float)) and relevance < 0.3:
+                st.caption(
+                    "_Low relevance: this fact may have appeared in nav, "
+                    "comments, or sidebar text rather than the page's main content._"
+                )
+            context = hit.get("context")
+            if context:
+                st.caption(f"_Context:_ {context}")
+
+
+def _render_hallucinations(notes: List[str]) -> None:
+    """Render hallucination / forensic observations inside expanders."""
+    if not notes:
+        st.success("No hallucination or forensic red flags detected.")
+        return
+    for i, note in enumerate(notes, 1):
+        with st.expander(f"Observation {i}", expanded=(i <= 2)):
+            st.markdown(note)
+
+
+def _render_report(report: Dict[str, Any]) -> None:
+    """Render the full verification report."""
+    score = int(report.get("veracity_score", 0))
+    mm = report.get("multimodal_consistency", {})
+
+    # --- Top row: donut + summary metrics ---
+    top_l, top_r = st.columns([1, 2], gap="large")
+
+    with top_l:
+        st.markdown('<div class="og-card">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="og-card-title">Overall Veracity</div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(_veracity_donut(score), use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with top_r:
+        st.markdown('<div class="og-card">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="og-card-title">Multimodal Consistency</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(_badge_row(mm), unsafe_allow_html=True)
+        summary = mm.get("summary")
+        if summary:
+            st.caption(summary)
+        # Diagnostic chips for quick reading
+        gen = report.get("generated_at", "")
+        ms = report.get("analysis_duration_ms", 0)
+        ct = (report.get("content_type") or "n/a").upper()
+        st.markdown(
+            f"<div style='margin-top:14px;'>"
+            f'<span class="og-badge neutral"><span class="dot"></span>'
+            f"Type: {ct}</span>"
+            f'<span class="og-badge neutral"><span class="dot"></span>'
+            f"Latency: {ms} ms</span>"
+            f'<span class="og-badge neutral"><span class="dot"></span>'
+            f"Generated: {gen}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- Cross-reference hits ---
+    st.markdown("### 🔗 Cross-Reference Facts")
+    _render_cross_ref(report.get("cross_reference_results", []))
+
+    # --- Hallucination / forensic warnings ---
+    st.markdown("### ⚠️ Hallucination & Forensic Warnings")
+    _render_hallucinations(report.get("hallucination_report", []))
+
+
+# =====================================================================
+# Sidebar
+# =====================================================================
+@st.cache_data(show_spinner=False, ttl=60)
+def _llm_health_cached(_nonce: int = 0) -> Dict[str, Any]:
+    """
+    Cached health probe. The result is memoised for 60 seconds so we
+    don't hit OpenAI on every widget re-render. The Re-probe button
+    bumps ``_nonce`` to invalidate the cache.
+    """
+    return probe_llm_health()
+
+
+def _render_sidebar() -> None:
+    # Nonce stored in session_state; bumping it invalidates the cache.
+    if "llm_probe_nonce" not in st.session_state:
+        st.session_state["llm_probe_nonce"] = 0
+
+    with st.sidebar:
+        st.markdown("## 🛡️ OmniGuard AI")
+        st.caption("Real-time multimodal verification")
+
+        st.divider()
+        st.markdown("### System status")
+
+        if not is_llm_available():
+            st.warning(
+                "LLM augmentation: **offline**\n\n"
+                "Set `OPENAI_API_KEY` as a system env var to enable it."
+            )
+        else:
+            health = _llm_health_cached(_nonce=st.session_state["llm_probe_nonce"])
+            if health.get("ok"):
+                st.success("LLM augmentation: **online** (probe OK)")
+            else:
+                reason = health.get("reason", "unknown")
+                st.error(
+                    "LLM augmentation: **unreachable**\n\n"
+                    f"Key is set but the API is not responding: _{reason}_\n\n"
+                    "The dashboard will continue to work in heuristic-only mode."
+                )
+
+            if st.button(
+                "🔄 Re-probe LLM",
+                use_container_width=True,
+                help="Re-check the OpenAI endpoint (60s cache).",
+                key="probe_llm_btn",
+            ):
+                st.session_state["llm_probe_nonce"] += 1
+                st.rerun()
+
+        st.markdown("### Modules")
+        for label in (
+            "Text / article analysis",
+            "URL page parsing",
+            "Image forensic header",
+            "Video container header",
+            "Audio container header",
+        ):
+            st.markdown(f"- {label}")
+
+        st.divider()
+        st.caption("Heuristic pipeline: utils/verifier.py · LLM: utils/llm.py")
+
+
+# =====================================================================
+# Main
+# =====================================================================
+def main() -> None:
+    _inject_theme_css()
+    _render_sidebar()
+
+    # ---- Hero ----
+    st.markdown(
+        "<h1>🛡️ OmniGuard AI</h1>"
+        "<p style='color:#94a3b8; margin-top:-8px;'>"
+        "Paste a video link, an article, or a social thread — "
+        "get a forensic-style veracity report in seconds."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- Content-type toggle + input ----
+    labels = [opt[0] for opt in CONTENT_TYPE_OPTIONS]
+    chosen_label = st.radio(
+        "Content type",
+        labels,
+        index=1,  # default: Text Article
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    chosen_type = dict(CONTENT_TYPE_OPTIONS)[chosen_label]
+
+    # Map display label -> prompt key
+    if chosen_type == "url":
+        prompt_key = "url"
+    elif chosen_label.startswith("🧵"):
+        prompt_key = "text_social"
+    else:
+        prompt_key = "text_article"
+
+    st.markdown(
+        f"<div class='og-card-title' style='margin-top:14px;'>"
+        f"{CONTENT_TYPE_PROMPTS[prompt_key]}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Single input widget that adapts to the content type
+    if chosen_type == "url":
+        user_input = st.text_input(
+            "Input",
+            placeholder="https://...",
+            label_visibility="collapsed",
+            key="primary_input",
+        )
+    else:
+        user_input = st.text_area(
+            "Input",
+            height=200,
+            placeholder=(
+                "Paste text here..."
+                if prompt_key == "text_article"
+                else "Tweet 1...\nTweet 2...\nTweet 3..."
+            ),
+            label_visibility="collapsed",
+            key="primary_input",
+        )
+
+    # ---- Analyze button + spinner ----
+    clicked = st.button(
+        "🔍  Analyze with OmniGuard",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if not clicked:
+        st.markdown(
+            "<div class='og-card' style='text-align:center; color:#94a3b8;'>"
+            "Awaiting input. Choose a content type above and paste your "
+            "content, then press <b>Analyze with OmniGuard</b>."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    if not user_input or not user_input.strip():
+        st.warning("Please paste some content first.")
+        return
+
+    # Map the chosen content-type to the backend content_type arg
+    backend_type = "url" if chosen_type == "url" else "text"
+
+    with st.spinner("🛡️ OmniGuard is analysing the content..."):
+        report = _run_analysis(backend_type, user_input.strip())
+        # Carry the raw text through so the LLM augmentation can use it
+        if backend_type == "text":
+            report["_raw_text"] = user_input
+        if is_llm_available():
+            try:
+                report = llm_enrich_report(report)
+            except Exception:
+                # Never let an LLM error block the heuristic output.
+                pass
+
+    _render_report(report)
+
+
+if __name__ == "__main__":
+    main()
