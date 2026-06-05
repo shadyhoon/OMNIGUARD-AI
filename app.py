@@ -723,13 +723,31 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
 # =====================================================================
 # Sidebar
 # =====================================================================
-@st.cache_data(show_spinner=False, ttl=60)
+def _api_health(api_url: str, _nonce: int = 0) -> bool:
+    """
+    Cheap GET against the FastAPI /health endpoint. No caching - the
+    backend can be started or stopped between renders, and a hung
+    request is short (2 s timeout). The ``_nonce`` arg lets the
+    Re-probe button invalidate any future cache.
+    """
+    try:
+        import requests
+        r = requests.get(f"{api_url}/health", timeout=2)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def _llm_health_cached(_nonce: int = 0, _provider: Optional[str] = None) -> Dict[str, Any]:
     """
-    Cached health probe. The result is memoised for 60 seconds so we
-    don't hit OpenAI on every widget re-render. The Re-probe button
-    bumps ``_nonce`` to invalidate the cache. ``_provider`` lets
-    the user force a specific backend (e.g. Gemini).
+    Probe the LLM provider's health. The ``_nonce`` and ``_provider``
+    parameters are deliberately unused in the body - they exist only
+    so the Re-probe button and the provider dropdown can invalidate
+    the result. We intentionally do NOT use ``st.cache_data`` here
+    because ``None`` argument hashing interacts badly with provider
+    overrides: cached results would stick across provider changes.
+    The provider probe is a single small request (5 tokens), so the
+    cost of skipping the cache is negligible.
     """
     return probe_llm_health(name=_provider)
 
@@ -758,6 +776,23 @@ def _render_sidebar() -> None:
 
         st.divider()
         st.markdown("### System status")
+
+        # FastAPI backend health badge. The dashboard can run without
+        # uvicorn (in-process pipeline), but if the user has ticked
+        # "Call FastAPI backend" in Advanced options they will see a
+        # connection error on every analyze. Show the state up front.
+        api_url = os.getenv("OMNIGUARD_API_URL", "http://localhost:8000")
+        api_up = _api_health(api_url, _nonce=st.session_state["llm_probe_nonce"])
+        if api_up:
+            st.success(f"FastAPI backend: **online** (`{api_url}`)")
+        else:
+            st.warning(
+                f"FastAPI backend: **offline** (`{api_url}`)\n\n"
+                "Start it in another terminal with:\n"
+                "```\nuvicorn api:app --host 0.0.0.0 --port 8000\n```\n"
+                "Or uncheck 'Call FastAPI backend' in Advanced options "
+                "to use the in-process pipeline."
+            )
 
         # LLM provider selector (auto-detect by default).
         detected = available_providers()
