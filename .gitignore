@@ -10,6 +10,13 @@ venv/
 
 # Environment
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.secret
+credentials*
+*.credentials
 
 # Local data (Chroma vector store, yt-dlp temp downloads)
 data/

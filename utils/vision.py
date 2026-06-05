@@ -185,8 +185,13 @@ def extract_frames(
     if max_frames >= total:
         indices = list(range(total))
     else:
-        step = total / float(max_frames)
-        indices = [int(i * step) for i in range(max_frames)]
+        # Linspace over [0, total-1] so we always sample distinct,
+        # evenly-spaced frame indices. The old `int(i * step)` formula
+        # collapsed to the same integer for many i on short clips.
+        last = max(total - 1, 0)
+        indices = [int(round(i * last / (max_frames - 1))) for i in range(max_frames)]
+        # Dedup defensively in case max_frames == 1.
+        indices = sorted(set(indices))
     frames: List = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)

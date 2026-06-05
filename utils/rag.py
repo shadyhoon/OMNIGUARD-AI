@@ -263,7 +263,13 @@ def _chroma_query(claim: str, threshold: float = 0.65) -> Optional[Dict[str, Any
         return None
     if not result or not result.get("ids") or not result["ids"][0]:
         return None
-    distance = result["distances"][0][0]
+    # Chroma returns distances=None (not []) when the store is empty
+    # after a delete, or when the embed was rejected. Guard the same way
+    # we guard ids, otherwise the next line throws on None.
+    distances = result.get("distances")
+    if not distances or not distances[0]:
+        return None
+    distance = distances[0][0]
     # Cosine distance -> cosine similarity
     relevance = max(0.0, 1.0 - float(distance))
     if relevance < threshold:

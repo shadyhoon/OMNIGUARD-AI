@@ -187,7 +187,11 @@ def _seeded_random(*keys: Any) -> random.Random:
 # =====================================================================
 # Text analysis
 # =====================================================================
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# Split on sentence-ending punctuation, but require the next non-space
+# character to be a capital letter or a digit. This avoids splitting
+# on decimal points ("Pi is 3.14 and...") or abbreviations ("U.S. and...")
+# while still handling "... Today!" cleanly.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]+")
 
 
@@ -296,11 +300,16 @@ def _hallucination_signals(text: str, features: Dict[str, Any]) -> List[str]:
         )
 
     # Look for assertive "guarantee" / "absolute" language without citation.
-    assertive_re = re.compile(
-        r"\b(guarantee[sd]?|always|never|everyone|nobody|100%|proven|definitive[ly]?)\b",
-        re.IGNORECASE,
-    )
-    assertive_hits = sorted(set(assertive_re.findall(text)))
+    # Skip on very short inputs - a single "never" in a 1-word sentence
+    # is not a meaningful signal.
+    if features.get("word_count", 0) >= 10:
+        assertive_re = re.compile(
+            r"\b(guarantee[sd]?|always|never|everyone|nobody|100%|proven|definitive[ly]?)\b",
+            re.IGNORECASE,
+        )
+        assertive_hits = sorted(set(assertive_re.findall(text)))
+    else:
+        assertive_hits = []
     if assertive_hits:
         signals.append(
             "Assertive absolute language used: "
@@ -841,10 +850,13 @@ def _veracity_score(
         voice = multimodal.get("voice_consistency_score", 0.7)
         score += int((voice - 0.5) * 20)
 
-    # Cross-reference adjustments
-    confirmed = sum(1 for r in cross_refs if r["status"] == "confirmed")
-    falses = sum(1 for r in cross_refs if r["status"] == "false")
-    errors = sum(1 for r in cross_refs if r["status"] == "error")
+    # Cross-reference adjustments. Off-topic hits (relevance < 0.45)
+    # are dropped before counting: a sidebar link on a long Wikipedia
+    # page shouldn't drag the score down by 30 points.
+    relevant_refs = [r for r in cross_refs if r.get("relevance", 1.0) >= 0.45]
+    confirmed = sum(1 for r in relevant_refs if r["status"] == "confirmed")
+    falses = sum(1 for r in relevant_refs if r["status"] == "false")
+    errors = sum(1 for r in relevant_refs if r["status"] == "error")
     score += min(15, confirmed * 5)
     score -= min(30, falses * 10)
     score -= min(10, errors * 3)
@@ -956,6 +968,17 @@ def analyze_content(
     content_type = (content_type or "").strip().lower()
     started_at = time.time()
 
+    # Reject empty / whitespace-only / null-byte text early. The
+    # heuristic pipeline will happily produce a confident-looking
+    # 65 score for "   " or "\x00", which is misleading and worse
+    # than raising. Image/video/audio are out of scope - they are
+    # validated by their own branches.
+    if content_type == "text" and isinstance(user_input, str):
+        if "\x00" in user_input:
+            raise ValueError("text input contains null bytes")
+        if not user_input.strip():
+            raise ValueError("text input is empty or whitespace-only")
+
     # ------------------------------------------------------------------
     # Normalise the input into the shape each branch expects.
     # ------------------------------------------------------------------
@@ -963,12 +986,32 @@ def analyze_content(
     file_path: Optional[str] = None
     raw_bytes: Optional[bytes] = None
     url_value: Optional[str] = None
+    url_fetch_error: Optional[str] = None
 
     if content_type == "url":
         if not isinstance(user_input, str):
             raise TypeError("For content_type='url', user_input must be a string URL.")
         url_value = user_input
-        text_payload = user_input
+        # Validate the scheme so a local path doesn't slip into the URL
+        # branch (which would later try to parse it as HTML).
+        try:
+            _parsed = urllib.parse.urlparse(user_input)
+        except Exception:
+            _parsed = None
+        if _parsed is None or _parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"content_type='url' requires an http(s) URL, got: {user_input!r}"
+            )
+        # Actually fetch the page so text analysis + the meta-tag
+        # fallback can see real content. If the fetch fails we leave
+        # text_payload empty and let the caller surface the error.
+        try:
+            raw_bytes, _final_url = _fetch_url_head(user_input)
+            soup = BeautifulSoup(raw_bytes, "html.parser")
+            text_payload = _extract_main_text(soup) if soup else ""
+        except Exception as exc:
+            text_payload = ""
+            url_fetch_error = f"remote_fetch_failed: {exc}"
     elif content_type == "text":
         if isinstance(user_input, str):
             text_payload = user_input
@@ -1120,6 +1163,7 @@ def analyze_content(
         "content_type": content_type,
         "generated_at": _now_iso(),
         "analysis_duration_ms": elapsed_ms,
+        "url_fetch_error": url_fetch_error,
         "diagnostics": {
             "text_features": text_features,
             "multimodal_raw": multimodal,

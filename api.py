@@ -171,9 +171,30 @@ async def analyze_upload(
         raise HTTPException(
             status_code=400, detail="content_type must be 'image', 'video' or 'audio'"
         )
-    suffix = os.path.splitext(file.filename or "")[-1] or ""
+    # Cap the upload so a malicious or accidental 4 GB file can't OOM
+    # the worker. 50 MB is well above any real image and matches the
+    # downstream yt-dlp filesize cap.
+    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    suffix = os.path.splitext(file.filename or "")[-1].lower() or ""
+    # Allow-list the suffix; reject anything that looks like a script
+    # or executable, and prevent a `../` path-traversal style suffix.
+    allowed_suffixes = {
+        "", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+        ".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".ogg", ".flac",
+    }
+    if suffix not in allowed_suffixes:
+        raise HTTPException(
+            status_code=400, detail=f"unsupported file extension: {suffix!r}"
+        )
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        data = await file.read()
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            tmp.close()
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+            raise HTTPException(status_code=413, detail="upload too large (max 50 MB)")
         tmp.write(data)
         tmp_path = tmp.name
     try:

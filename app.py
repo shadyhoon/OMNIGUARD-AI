@@ -610,19 +610,17 @@ def _render_report(report: Dict[str, Any]) -> None:
         summary = mm.get("summary")
         if summary:
             st.caption(summary)
-        # Diagnostic chips for quick reading
-        gen = report.get("generated_at", "")
-        ms = report.get("analysis_duration_ms", 0)
-        ct = (report.get("content_type") or "n/a").upper()
+        # Diagnostic chips for quick reading. All three values are
+        # HTML-escaped inside the helper because the block is rendered
+        # with unsafe_allow_html=True; an attacker who can influence
+        # the report (LLM, URL fetch, etc.) must not be able to break
+        # out of the <span>.
         st.markdown(
-            f"<div style='margin-top:14px;'>"
-            f'<span class="og-badge neutral"><span class="dot"></span>'
-            f"Type: {ct}</span>"
-            f'<span class="og-badge neutral"><span class="dot"></span>'
-            f"Latency: {ms} ms</span>"
-            f'<span class="og-badge neutral"><span class="dot"></span>'
-            f"Generated: {gen}</span>"
-            f"</div>",
+            _build_report_chip_html(
+                content_type=report.get("content_type") or "n/a",
+                generated_at=str(report.get("generated_at", "")),
+                analysis_duration_ms=int(report.get("analysis_duration_ms", 0) or 0),
+            ),
             unsafe_allow_html=True,
         )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -725,12 +723,37 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
 # =====================================================================
 # Sidebar
 # =====================================================================
-def _api_health(api_url: str, _nonce: int = 0) -> bool:
+def _build_report_chip_html(
+    *, content_type: str, generated_at: str, analysis_duration_ms: int
+) -> str:
+    """
+    Build the small "Type / Latency / Generated" diagnostic row that
+    appears under the verdict. Returned as a string; the caller
+    renders it with ``unsafe_allow_html=True``. Every value is
+    HTML-escaped here so an attacker who can influence the report
+    (LLM output, URL fetch, etc.) cannot break out of the <span>.
+    """
+    import html as _html
+    gen = _html.escape(generated_at)
+    ct = _html.escape(str(content_type or "n/a").upper())
+    ms = int(analysis_duration_ms or 0)
+    return (
+        "<div style='margin-top:14px;'>"
+        '<span class="og-badge neutral"><span class="dot"></span>'
+        f"Type: {ct}</span>"
+        '<span class="og-badge neutral"><span class="dot"></span>'
+        f"Latency: {ms} ms</span>"
+        '<span class="og-badge neutral"><span class="dot"></span>'
+        f"Generated: {gen}</span>"
+        "</div>"
+    )
+
+
+def _api_health(api_url: str) -> bool:
     """
     Cheap GET against the FastAPI /health endpoint. No caching - the
     backend can be started or stopped between renders, and a hung
-    request is short (2 s timeout). The ``_nonce`` arg lets the
-    Re-probe button invalidate any future cache.
+    request is short (2 s timeout).
     """
     try:
         import requests
@@ -740,16 +763,14 @@ def _api_health(api_url: str, _nonce: int = 0) -> bool:
         return False
 
 
-def _llm_health_cached(_nonce: int = 0, _provider: Optional[str] = None) -> Dict[str, Any]:
+@st.cache_data(ttl=60, show_spinner=False)
+def _llm_health_cached(_provider: Optional[str] = None) -> Dict[str, Any]:
     """
-    Probe the LLM provider's health. The ``_nonce`` and ``_provider``
-    parameters are deliberately unused in the body - they exist only
-    so the Re-probe button and the provider dropdown can invalidate
-    the result. We intentionally do NOT use ``st.cache_data`` here
-    because ``None`` argument hashing interacts badly with provider
-    overrides: cached results would stick across provider changes.
-    The provider probe is a single small request (5 tokens), so the
-    cost of skipping the cache is negligible.
+    Probe the LLM provider's health. Cached for 60s so a user editing
+    the input or hovering over a metric doesn't burn Gemini quota.
+    The Re-probe button and the provider dropdown pass a fresh
+    ``_provider`` value, which is a cache key - so provider switches
+    always re-probe, but no-op reruns hit the cache.
     """
     return probe_llm_health(name=_provider)
 
@@ -766,9 +787,6 @@ def _selected_provider_name() -> Optional[str]:
 
 
 def _render_sidebar() -> None:
-    # Nonce stored in session_state; bumping it invalidates the cache.
-    if "llm_probe_nonce" not in st.session_state:
-        st.session_state["llm_probe_nonce"] = 0
     if "llm_provider_override" not in st.session_state:
         st.session_state["llm_provider_override"] = "auto"
 
@@ -784,7 +802,7 @@ def _render_sidebar() -> None:
         # "Call FastAPI backend" in Advanced options they will see a
         # connection error on every analyze. Show the state up front.
         api_url = os.getenv("OMNIGUARD_API_URL", "http://localhost:8000")
-        api_up = _api_health(api_url, _nonce=st.session_state["llm_probe_nonce"])
+        api_up = _api_health(api_url)
         if api_up:
             st.success(f"FastAPI backend: **online** (`{api_url}`)")
         else:
@@ -824,10 +842,7 @@ def _render_sidebar() -> None:
                 f"Set `{needed}` as a system env var to enable it."
             )
         else:
-            health = _llm_health_cached(
-                _nonce=st.session_state["llm_probe_nonce"],
-                _provider=chosen,
-            )
+            health = _llm_health_cached(_provider=chosen)
             if health.get("ok"):
                 prov = health.get("provider") or "?"
                 model = health.get("model") or "?"
@@ -849,7 +864,9 @@ def _render_sidebar() -> None:
                 help="Re-check the LLM endpoint (60s cache).",
                 key="probe_llm_btn",
             ):
-                st.session_state["llm_probe_nonce"] += 1
+                # Drop the cache entry for the current provider so the
+                # next read forces a fresh probe.
+                _llm_health_cached.clear()
                 st.rerun()
 
         st.markdown("### Modules")

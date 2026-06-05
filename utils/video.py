@@ -72,6 +72,21 @@ def download_video_clip(
     """
     if not url:
         return {"ok": False, "error": "empty_url"}
+
+    # Clamp the knobs so a misconfigured caller can't pass a string
+    # that breaks out of the -t argument and reaches the shell via
+    # yt-dlp's external_downloader_args. These also defend against
+    # a runaway download.
+    try:
+        max_duration_sec = int(max_duration_sec)
+    except Exception:
+        max_duration_sec = DEFAULT_MAX_DURATION_SEC
+    max_duration_sec = max(1, min(max_duration_sec, 600))
+    try:
+        max_filesize_mb = int(max_filesize_mb)
+    except Exception:
+        max_filesize_mb = DEFAULT_MAX_FILESIZE_MB
+    max_filesize_mb = max(1, min(max_filesize_mb, 200))
     if not is_ytdlp_available():
         return {"ok": False, "error": "yt_dlp_not_installed"}
 
