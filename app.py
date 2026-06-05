@@ -702,7 +702,9 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
                 ok = c.get("succeeded")
                 kind = c.get("kind", "?")
                 target = c.get("target", "")
-                rid = c.get("response_id") or "-"
+                # Gemini's google-genai SDK doesn't echo a per-request
+                # id, so we surface "(none)" instead of a fake "-".
+                rid = c.get("response_id") or "(none)"
                 latency = c.get("latency_ms") or 0
                 tok_in = c.get("tokens_in")
                 tok_out = c.get("tokens_out")
