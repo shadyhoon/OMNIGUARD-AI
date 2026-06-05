@@ -741,25 +741,11 @@ def _cross_reference(content_type: str, user_input: Union[str, bytes, Dict[str, 
         if parsed.scheme in ("http", "https"):
             results.extend(_parse_url_for_facts(user_input))
 
-    # 3. Always include a few "live web" pseudo-matches so the UI has
-    #    something to show even when no claim is recognised. These
-    #    are clearly labelled as simulated.
-    if not results:
-        rng = _seeded_random(content_type, str(user_input)[:200])
-        pool = list(_LIVE_FACTS)
-        rng.shuffle(pool)
-        for fact in pool[:3]:
-            results.append(
-                {
-                    "claim": fact["claim"],
-                    "status": fact["status"],
-                    "source": fact["source"],
-                    "summary": fact["summary"],
-                    "context": "Simulated web match (no direct hit in input).",
-                    "relevance": 0.0,
-                }
-            )
-
+    # 3. No fabricated fallbacks. If no canonical claim was matched
+    #    in the input, we return an empty list and let the UI tell
+    #    the user "no cross-reference hits". Filling the panel with
+    #    unrelated facts (e.g. showing the sun, water, vaccines when
+    #    the input is about the moon) was misleading and is removed.
     return results
 
 
@@ -897,6 +883,7 @@ def _multimodal_consistency(content_type: str, multimodal: Dict[str, Any]) -> Di
 def analyze_content(
     content_type: str,
     user_input: Union[str, bytes, os.PathLike, Dict[str, Any], None],
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Run the full verification pipeline and return a structured report.
@@ -1012,12 +999,38 @@ def analyze_content(
     # ------------------------------------------------------------------
     # Cross-reference
     # ------------------------------------------------------------------
+    # Lightweight path: substring / word-boundary match against the
+    # built-in fact table. Always runs.
     if content_type == "url" and url_value:
         cross_refs = _cross_reference("url", url_value)
     elif content_type in ("text",):
         cross_refs = _cross_reference("text", text_payload)
     else:
         cross_refs = _cross_reference(content_type, user_input if user_input is not None else "")
+
+    # Optional RAG path: Chroma + DuckDuckGo + sentence-transformers.
+    # Heavier, slower, but covers claims outside the built-in fact
+    # table. Disabled by default; enabled via ``use_rag=True``.
+    use_rag = bool(kwargs.get("use_rag", False))
+    rag_engine = str(kwargs.get("rag_engine", "chroma+ddg"))
+    if use_rag and content_type in ("text", "url") and (text_payload or url_value):
+        try:
+            from utils.rag import rag_cross_reference  # lazy import
+
+            rag_input = text_payload or url_value or ""
+            rag_hits = rag_cross_reference(rag_input)
+            # Merge: RAG hits first (they're richer), then lightweight hits
+            # we don't already cover, deduped by claim text.
+            seen_claims = {(h.get("claim") or "").strip().lower() for h in rag_hits}
+            for h in cross_refs:
+                key = (h.get("claim") or "").strip().lower()
+                if key and key not in seen_claims:
+                    rag_hits.append(h)
+                    seen_claims.add(key)
+            cross_refs = rag_hits
+        except Exception:
+            # RAG is optional; never let it break the lightweight path.
+            pass
 
     # ------------------------------------------------------------------
     # Hallucination / synthesis report

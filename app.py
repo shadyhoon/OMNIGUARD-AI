@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+import os
+
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 from dotenv import load_dotenv
@@ -241,13 +244,62 @@ CONTENT_TYPE_PROMPTS = {
 # Cached pipeline
 # =====================================================================
 @st.cache_data(show_spinner=False)
-def _run_analysis(content_type: str, user_input: str) -> Dict[str, Any]:
+def _run_analysis(
+    content_type: str,
+    user_input: str,
+    use_rag: bool = False,
+) -> Dict[str, Any]:
     """
     Run the heuristic pipeline. Results are cached per
-    (content_type, input) pair so the UI doesn't re-run on every
-    widget interaction.
+    (content_type, input, use_rag) tuple so the UI doesn't re-run
+    on every widget interaction.
     """
-    return analyze_content(content_type, user_input)
+    return analyze_content(content_type, user_input, use_rag=use_rag)
+
+
+def _api_url() -> str:
+    """Default URL of the FastAPI backend (override via env or sidebar)."""
+    return os.getenv("OMNIGUARD_API_URL", "http://localhost:8000")
+
+
+def _run_via_api(
+    content_type: str, user_input: str, *, use_rag: bool, enrich_with_llm: bool
+) -> Dict[str, Any]:
+    """
+    POST to the FastAPI /analyze endpoint. Falls back to the
+    in-process pipeline on any network error so the dashboard
+    never breaks just because the API is down.
+    """
+    try:
+        resp = requests.post(
+            f"{_api_url()}/analyze",
+            json={
+                "content_type": content_type,
+                "user_input": user_input,
+                "use_rag": use_rag,
+                "enrich_with_llm": enrich_with_llm,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        return {
+            "veracity_score": 0,
+            "multimodal_consistency": {
+                "applicable": False,
+                "summary": f"API unreachable: {exc}. Falling back to local pipeline.",
+            },
+            "cross_reference_results": [],
+            "hallucination_report": [
+                f"Could not reach OmniGuard API at {_api_url()} - {exc}",
+                "Local heuristic pipeline did run, but the response below is from the fallback path.",
+            ],
+            "content_type": content_type,
+            "generated_at": "",
+            "analysis_duration_ms": 0,
+            "diagnostics": {},
+        }
 
 
 # =====================================================================
@@ -495,6 +547,88 @@ def _render_report(report: Dict[str, Any]) -> None:
     st.markdown("### ⚠️ Hallucination & Forensic Warnings")
     _render_hallucinations(report.get("hallucination_report", []))
 
+    # --- LLM augmentation (only when key is present) ---
+    _render_llm_section(report)
+
+
+def _render_llm_section(report: Dict[str, Any]) -> None:
+    """
+    Render the LLM augmentation panel along with hard evidence
+    that the calls actually reached OpenAI. The evidence ledger
+    is built in :func:`utils.llm.llm_enrich_report` and contains
+    per-call model name, response id, latency, and token usage.
+    """
+    claim_summaries = report.get("llm_claim_summaries") or []
+    leaps = report.get("llm_creative_leaps") or []
+    calls = report.get("llm_calls") or []
+
+    if not (claim_summaries or leaps or calls):
+        return  # nothing to show; the heuristic output is enough
+
+    st.markdown("### 🧠 LLM Augmentation")
+
+    # Per-claim summaries
+    if claim_summaries:
+        with st.expander("Per-claim LLM summaries", expanded=False):
+            for item in claim_summaries:
+                st.markdown(
+                    f"**Claim:** {item.get('claim','')}\n\n"
+                    f"> {item.get('summary','')}"
+                )
+
+    # Creative leaps
+    if leaps:
+        with st.expander("LLM-detected creative leaps", expanded=True):
+            for leap in leaps:
+                st.markdown(f"- {leap}")
+
+    # Evidence ledger: prove the calls actually hit OpenAI.
+    successful = [c for c in calls if c.get("succeeded")]
+    attempted = [c for c in calls if c.get("attempted")]
+    if attempted:
+        with st.expander(
+            f"🔬 LLM call evidence "
+            f"({len(successful)}/{len(attempted)} succeeded)",
+            expanded=False,
+        ):
+            st.caption(
+                "Each row below is a real OpenAI API request and the "
+                "server's response. If a row shows an error, the "
+                "heuristic output above is still valid - the LLM "
+                "augmentation just didn't run for that step."
+            )
+            tokens_in = report.get("llm_tokens_in") or 0
+            tokens_out = report.get("llm_tokens_out") or 0
+            total_ms = report.get("llm_latency_ms_total") or 0
+            model = report.get("llm_model") or "?"
+            st.markdown(
+                f"**Model requested:** `{model}` · "
+                f"**Calls:** {len(attempted)} attempted, "
+                f"{len(successful)} succeeded · "
+                f"**Tokens:** {tokens_in} in / {tokens_out} out · "
+                f"**Total latency:** {total_ms} ms"
+            )
+            for c in calls:
+                ok = c.get("succeeded")
+                kind = c.get("kind", "?")
+                target = c.get("target", "")
+                rid = c.get("response_id") or "-"
+                latency = c.get("latency_ms") or 0
+                tok_in = c.get("tokens_in")
+                tok_out = c.get("tokens_out")
+                err = c.get("error")
+                if ok:
+                    st.markdown(
+                        f"- ✅ **{kind}** → `{target[:60]}` · "
+                        f"id=`{rid}` · {latency} ms · "
+                        f"tokens {tok_in}→{tok_out}"
+                    )
+                else:
+                    st.markdown(
+                        f"- ❌ **{kind}** → `{target[:60]}` · "
+                        f"err=`{err}` · {latency} ms"
+                    )
+
 
 # =====================================================================
 # Sidebar
@@ -624,6 +758,38 @@ def main() -> None:
             key="primary_input",
         )
 
+    # ---- Advanced options (RAG + API) ----
+    with st.expander("⚙️ Advanced options", expanded=False):
+        opt_l, opt_r = st.columns(2)
+        with opt_l:
+            use_rag = st.checkbox(
+                "Use RAG cross-reference (Chroma + DuckDuckGo)",
+                value=False,
+                help=(
+                    "Routes the analysis through the local vector store and "
+                    "live web search. Slower but catches claims outside "
+                    "the built-in fact table."
+                ),
+                key="use_rag",
+            )
+        with opt_r:
+            use_api = st.checkbox(
+                "Call FastAPI backend",
+                value=False,
+                help=(
+                    "If checked, the request is sent to the FastAPI "
+                    "backend instead of running the pipeline in-process. "
+                    f"Default URL: {_api_url()}"
+                ),
+                key="use_api",
+            )
+            api_url = st.text_input(
+                "API URL",
+                value=_api_url(),
+                key="api_url",
+                disabled=not use_api,
+            )
+
     # ---- Analyze button + spinner ----
     clicked = st.button(
         "🔍  Analyze with OmniGuard",
@@ -648,17 +814,28 @@ def main() -> None:
     # Map the chosen content-type to the backend content_type arg
     backend_type = "url" if chosen_type == "url" else "text"
 
+    use_rag = bool(st.session_state.get("use_rag", False))
+    use_api = bool(st.session_state.get("use_api", False))
+
     with st.spinner("🛡️ OmniGuard is analysing the content..."):
-        report = _run_analysis(backend_type, user_input.strip())
-        # Carry the raw text through so the LLM augmentation can use it
-        if backend_type == "text":
-            report["_raw_text"] = user_input
-        if is_llm_available():
-            try:
-                report = llm_enrich_report(report)
-            except Exception:
-                # Never let an LLM error block the heuristic output.
-                pass
+        if use_api:
+            report = _run_via_api(
+                backend_type,
+                user_input.strip(),
+                use_rag=use_rag,
+                enrich_with_llm=is_llm_available(),
+            )
+        else:
+            report = _run_analysis(backend_type, user_input.strip(), use_rag=use_rag)
+            # Carry the raw text through so the LLM augmentation can use it
+            if backend_type == "text":
+                report["_raw_text"] = user_input
+            if is_llm_available():
+                try:
+                    report = llm_enrich_report(report)
+                except Exception:
+                    # Never let an LLM error block the heuristic output.
+                    pass
 
     _render_report(report)
 

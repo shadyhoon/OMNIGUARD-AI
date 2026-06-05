@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -115,16 +115,41 @@ def _get_client():
 # ---------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------
-def llm_summarise_claim(claim: str, model: str = "gpt-4o-mini") -> Optional[str]:
+def llm_summarise_claim(
+    claim: str, model: str = "gpt-4o-mini"
+) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Ask the LLM to produce a short, neutral, evidence-oriented
     summary of a single claim.
 
-    Returns ``None`` if the LLM is unavailable, the request fails,
-    or the response is empty.
+    Returns a ``(summary, call_info)`` tuple. ``call_info`` always
+    contains keys the UI can use as proof of the call:
+
+        * ``attempted``  - True if we tried to make the call
+        * ``succeeded``  - True if the API returned content
+        * ``model``      - model name (echoed by the server)
+        * ``latency_ms`` - round-trip time in milliseconds
+        * ``tokens_in``  - prompt tokens (if returned)
+        * ``tokens_out`` - completion tokens (if returned)
+        * ``response_id``- OpenAI response id (if returned)
+        * ``error``      - short error label on failure
+
+    The summary is ``None`` if the LLM is unavailable, the request
+    fails, or the response is empty.
     """
+    info: Dict[str, Any] = {
+        "attempted": False,
+        "succeeded": False,
+        "model": model,
+        "latency_ms": 0,
+        "tokens_in": None,
+        "tokens_out": None,
+        "response_id": None,
+        "error": None,
+    }
     if not is_llm_available():
-        return None
+        info["error"] = "llm_unavailable"
+        return None, info
 
     system_prompt = (
         "You are a careful fact-checking assistant. Given a claim, "
@@ -134,6 +159,9 @@ def llm_summarise_claim(claim: str, model: str = "gpt-4o-mini") -> Optional[str]
     )
     user_prompt = f"Claim: {claim.strip()}"
 
+    import time
+    started = time.time()
+    info["attempted"] = True
     try:
         client = _get_client()
         response = client.chat.completions.create(
@@ -145,32 +173,63 @@ def llm_summarise_claim(claim: str, model: str = "gpt-4o-mini") -> Optional[str]
             temperature=0.2,
             max_tokens=200,
         )
-    except Exception:  # broad: any SDK or network error
-        # Silent: the dashboard surfaces a friendly "unreachable"
-        # message in the sidebar via probe_llm_health(). Per-call
-        # errors do not need to spam the terminal.
-        return None
+    except Exception as exc:  # broad: any SDK or network error
+        info["latency_ms"] = int((time.time() - started) * 1000)
+        # Capture only the error code (e.g. "429", "insufficient_quota")
+        # so we never accidentally log the API key.
+        err = str(exc)
+        info["error"] = err.split("\n")[0][:120] or type(exc).__name__
+        return None, info
+
+    info["latency_ms"] = int((time.time() - started) * 1000)
 
     if not response.choices:
-        return None
+        info["error"] = "no_choices"
+        return None, info
     text = (response.choices[0].message.content or "").strip()
-    return text or None
+    if not text:
+        info["error"] = "empty_response"
+        return None, info
+
+    info["succeeded"] = True
+    info["response_id"] = getattr(response, "id", None)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        info["tokens_in"] = getattr(usage, "prompt_tokens", None)
+        info["tokens_out"] = getattr(usage, "completion_tokens", None)
+    # Echo back the actual model the server used (may differ from request)
+    if getattr(response, "model", None):
+        info["model"] = response.model
+    return text, info
 
 
 def llm_flag_creative_leaps(
     text: str, model: str = "gpt-4o-mini"
-) -> Optional[List[str]]:
+) -> Tuple[Optional[List[str]], Dict[str, Any]]:
     """
     Ask the LLM to identify potential 'creative leaps' / unsupported
     inferences in a piece of text.
 
-    Returns a list of short bullet-style observations, or ``None``
-    when the LLM is unavailable.
+    Returns ``(observations, call_info)``. See :func:`llm_summarise_claim`
+    for the ``call_info`` schema. Returns ``(None, info)`` when the
+    LLM is unavailable, the text is too short, or the request fails.
     """
+    info: Dict[str, Any] = {
+        "attempted": False,
+        "succeeded": False,
+        "model": model,
+        "latency_ms": 0,
+        "tokens_in": None,
+        "tokens_out": None,
+        "response_id": None,
+        "error": None,
+    }
     if not is_llm_available():
-        return None
+        info["error"] = "llm_unavailable"
+        return None, info
     if not text or len(text.strip()) < 20:
-        return None
+        info["error"] = "input_too_short"
+        return None, info
 
     system_prompt = (
         "You are a forensic text analyst. Identify specific sentences "
@@ -185,6 +244,9 @@ def llm_flag_creative_leaps(
         f"{text.strip()[:4000]}"
     )
 
+    import time
+    started = time.time()
+    info["attempted"] = True
     try:
         client = _get_client()
         response = client.chat.completions.create(
@@ -197,15 +259,21 @@ def llm_flag_creative_leaps(
             max_tokens=300,
             response_format={"type": "json_object"},
         )
-    except Exception:
-        # Silent failure - see note in llm_summarise_claim().
-        return None
+    except Exception as exc:
+        info["latency_ms"] = int((time.time() - started) * 1000)
+        err = str(exc)
+        info["error"] = err.split("\n")[0][:120] or type(exc).__name__
+        return None, info
+
+    info["latency_ms"] = int((time.time() - started) * 1000)
 
     if not response.choices:
-        return None
+        info["error"] = "no_choices"
+        return None, info
     raw = (response.choices[0].message.content or "").strip()
     if not raw:
-        return None
+        info["error"] = "empty_response"
+        return None, info
 
     # Parse the JSON object. The model is asked to return an object
     # containing a list, but we accept a bare list as a fallback.
@@ -214,7 +282,8 @@ def llm_flag_creative_leaps(
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        info["error"] = "json_parse_error"
+        return None, info
 
     if isinstance(parsed, list):
         observations = [str(x) for x in parsed if str(x).strip()]
@@ -229,7 +298,15 @@ def llm_flag_creative_leaps(
     else:
         observations = []
 
-    return observations or None
+    info["succeeded"] = True
+    info["response_id"] = getattr(response, "id", None)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        info["tokens_in"] = getattr(usage, "prompt_tokens", None)
+        info["tokens_out"] = getattr(usage, "completion_tokens", None)
+    if getattr(response, "model", None):
+        info["model"] = response.model
+    return (observations or None), info
 
 
 def llm_enrich_report(
@@ -251,6 +328,13 @@ def llm_enrich_report(
     enriched["llm_claim_summaries"] = []
     enriched["llm_creative_leaps"] = []
     enriched["llm_available"] = is_llm_available()
+    # Evidence-of-call ledger. Each entry proves one real OpenAI
+    # request was attempted and what the server returned.
+    enriched["llm_calls"] = []
+    enriched["llm_tokens_in"] = 0
+    enriched["llm_tokens_out"] = 0
+    enriched["llm_latency_ms_total"] = 0
+    enriched["llm_model"] = model
 
     if not is_llm_available():
         return enriched
@@ -260,7 +344,15 @@ def llm_enrich_report(
         claim = hit.get("claim")
         if not claim or claim.startswith("("):
             continue
-        summary = llm_summarise_claim(claim, model=model)
+        summary, info = llm_summarise_claim(claim, model=model)
+        info_with_kind = dict(info)
+        info_with_kind["kind"] = "claim_summary"
+        info_with_kind["target"] = claim
+        enriched["llm_calls"].append(info_with_kind)
+        if info.get("succeeded"):
+            enriched["llm_tokens_in"] += info.get("tokens_in") or 0
+            enriched["llm_tokens_out"] += info.get("tokens_out") or 0
+            enriched["llm_latency_ms_total"] += info.get("latency_ms") or 0
         if summary:
             enriched["llm_claim_summaries"].append(
                 {"claim": claim, "summary": summary}
@@ -269,18 +361,21 @@ def llm_enrich_report(
     # 2. Creative-leap detection for text content only.
     if report.get("content_type") == "text":
         diagnostics = report.get("diagnostics", {}) or {}
-        # The heuristic step does not echo the full text in the
-        # report, so we accept a best-effort no-op if it is not
-        # available. The UI is expected to re-supply the original
-        # text via a hidden Streamlit session_state key.
         text_to_scan = enriched.get("_raw_text") or ""
         if not text_to_scan:
-            # Try to recover it from the input_summary if present.
             text_to_scan = (diagnostics.get("input_summary", {}) or {}).get(
                 "url", ""
             ) or ""
         if text_to_scan:
-            leaps = llm_flag_creative_leaps(text_to_scan, model=model)
+            leaps, info = llm_flag_creative_leaps(text_to_scan, model=model)
+            info_with_kind = dict(info)
+            info_with_kind["kind"] = "creative_leaps"
+            info_with_kind["target"] = "<submitted text>"
+            enriched["llm_calls"].append(info_with_kind)
+            if info.get("succeeded"):
+                enriched["llm_tokens_in"] += info.get("tokens_in") or 0
+                enriched["llm_tokens_out"] += info.get("tokens_out") or 0
+                enriched["llm_latency_ms_total"] += info.get("latency_ms") or 0
             if leaps:
                 enriched["llm_creative_leaps"] = leaps
 
