@@ -1,8 +1,9 @@
 # 🛡️ OmniGuard AI
 
-> A real-time multimodal verification dashboard for spotting misinformation, deepfakes, and AI-generated content.
+> **A real-time multimodal verification layer for AI-generated content.**
+> Built with Streamlit, FastAPI, OpenCV, ChromaDB, DuckDuckGo, and OpenAI.
 
-OmniGuard AI is a lightweight Streamlit dashboard that helps you decide whether a piece of content — a video link, a news article, or a social-media thread — is likely trustworthy, AI-generated, or factually dubious. It runs on modest hardware (8 GB RAM, no GPU) and avoids heavy deep-learning dependencies by combining a deterministic heuristic forensic pipeline with optional LLM augmentation.
+OmniGuard AI is a unified trust layer that scores the veracity of a news article, video link, image, audio clip, or social-media thread in real time. It combines a deterministic forensic pipeline, a Retrieval-Augmented Generation (RAG) cross-reference engine, an OpenCV vision layer, and an optional OpenAI augmentation path.
 
 ![OmniGuard AI hero](docs/screenshot-placeholder.png)
 <sub>_Add a real screenshot of the dashboard here before publishing._</sub>
@@ -13,10 +14,12 @@ OmniGuard AI is a lightweight Streamlit dashboard that helps you decide whether 
 
 - **Three content-type toggles, one unified button** — 🎬 Video Link · 📰 Text Article · 🧵 Social Media Thread.
 - **Forensic Veracity Score (0-100)** rendered as a Plotly donut chart, colour-coded emerald / amber / red.
-- **Multimodal Consistency** status badges for image, video, and audio inputs (Audio/Visual alignment · Lighting consistency · Artifact cleanliness).
-- **Cross-Reference Engine** that fetches a URL's *main* content, strips nav / sidebar / comment noise, and matches canonical claims using **word-boundary matching** with a **relevance score** (0-1).
-- **Hallucination & Forensic Warnings** that flag generative-AI tell-tales (e.g. *"a testament to"*, *"furthermore"*), long sentence patterns, low lexical diversity, and assertive absolute language.
-- **Optional LLM Augmentation** — when `OPENAI_API_KEY` is set as a system environment variable, an extra panel adds per-claim neutral summaries and creative-leap detection. Silently falls back to heuristic-only mode otherwise.
+- **OpenCV vision layer** for image and video frames — colour-cast / lighting consistency, JPEG blockiness, inter-frame luminance variance, edge density.
+- **RAG cross-reference engine** — sentence-transformers embeddings + local ChromaDB vector store of trusted truths, with a DuckDuckGo live-web fallback for unknown claims.
+- **Hallucination & Forensic Warnings** that flag generative-AI tell-tales, long sentence patterns, low lexical diversity, and assertive absolute language.
+- **Optional LLM Augmentation** — when `OPENAI_API_KEY` is set as a system environment variable, an extra panel adds per-claim neutral summaries and creative-leap detection. **🔬 LLM call evidence** expander shows the model name, response id, latency, and tokens for every call — proof the call actually happened.
+- **yt-dlp video downloader** for the Video Link toggle — caps file size and length so it stays polite to your disk and your bandwidth.
+- **FastAPI backend** at `api.py` exposing `/`, `/health`, `/analyze`, `/analyze/upload`. The Streamlit dashboard can call it directly (toggle in **⚙️ Advanced options**) or run the pipeline in-process.
 - **Dark, ultra-modern UI** with a glassy card layout, gradient hero, pill-style radio toggle, and status badges throughout.
 
 ---
@@ -31,20 +34,27 @@ cd omniguard-ai
 
 ### 2. Create the virtual environment and install dependencies
 
-**Windows (PowerShell):**
+**Lightweight install** (heuristics + LLM only, ~150 MB):
+```bash
+pip install -r requirements.txt
+```
+
+**Full-stack install** (RAG, OpenCV, FastAPI, yt-dlp, ~3 GB):
+```bash
+pip install -r requirements-full.txt
+```
+
+The full stack is recommended — the heavy dependencies (OpenCV, Chroma, sentence-transformers, yt-dlp) are imported lazily, so the dashboard still boots in a few seconds even when they're installed.
+
+**Windows convenience script:**
 ```powershell
 .\setup_env.bat
 ```
 
-**Linux / macOS (Bash):**
+**Linux / macOS:**
 ```bash
 bash setup_env.sh
 ```
-
-Both scripts will:
-- Create a `.venv` virtual environment (no global pollution)
-- Upgrade `pip`
-- Install everything from [`requirements.txt`](requirements.txt)
 
 ### 3. Run the dashboard
 
@@ -56,7 +66,15 @@ Both scripts will:
 .venv/bin/streamlit run app.py
 ```
 
-Then open <http://localhost:8501> in your browser. **No API key is required** — the heuristic pipeline works on its own.
+Open <http://localhost:8501> in your browser. **No API key is required** — the heuristic pipeline works on its own.
+
+### 4. (Optional) Run the FastAPI backend
+
+```bash
+.\.venv\Scripts\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8000
+```
+
+The interactive API docs are at <http://localhost:8000/docs>. Then in the dashboard, open **⚙️ Advanced options → Call FastAPI backend** and point it at the same URL.
 
 ---
 
@@ -90,26 +108,50 @@ A **🔄 Re-probe LLM** button is provided with a 60-second cache so the dashboa
 
 ## 🧠 How it works
 
-OmniGuard runs **two complementary pipelines**:
+OmniGuard runs **four complementary pipelines**, all wired together through a single report dict.
 
 ### 1. Heuristic forensic pipeline — [`utils/verifier.py`](utils/verifier.py)
 
-| Content type | What it analyses                                                                                                                                                                                                                                                                            |
-|--------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Text**     | Sentence / word counts, type-token ratio, punctuation & number density, LLM tell-tale phrases, assertive-language detection                                                                                                                                                                |
-| **Image**    | Magic-byte detection (PNG / JPEG / GIF / WEBP / BMP), per-block Shannon entropy, block-variance and alignment-anomaly signals, simulated lighting / artifact scores                                                                                                                          |
-| **Video**    | Container-header parsing (MP4 / MKV / AVI / MOV), byte-level entropy proxy, simulated frame / lighting / artifact scores                                                                                                                                                                    |
-| **Audio**    | RIFF/WAVE header parsing for sample rate & channels, byte-level entropy, voice-consistency and artifact proxies                                                                                                                                                                              |
-| **URL**      | Fetches the first 1 MB, extracts `<article>` → `<main>` → highest `<p>`-density block via BeautifulSoup, matches against a built-in fact table with word-boundary regex, and ranks hits by **relevance** (position × body length × occurrence count)                                       |
+| Content type | What it analyses |
+|--------------|------------------|
+| **Text**     | Sentence / word counts, type-token ratio, punctuation & number density, LLM tell-tale phrases, assertive-language detection |
+| **Image**    | Magic-byte detection, per-block Shannon entropy, block-variance and alignment-anomaly signals |
+| **Video**    | Container-header parsing (MP4 / MKV / AVI / MOV), byte-level entropy proxy, frame sampling for OpenCV pass |
+| **Audio**    | RIFF/WAVE header parsing, byte-level entropy, voice-consistency proxies |
+| **URL**      | Fetches the first 1 MB, extracts `<article>` → `<main>` → highest `<p>`-density block via BeautifulSoup, matches against a built-in fact table with word-boundary regex, ranks by **relevance** |
 
-> **Why no PIL / ffmpeg / opencv?** Image / video / audio signals are derived from header + byte-level entropy only. This keeps the working set tiny and lets the app run comfortably on 8 GB RAM machines.
+### 2. RAG cross-reference engine — [`utils/rag.py`](utils/rag.py)
 
-### 2. Optional LLM augmentation — [`utils/llm.py`](utils/llm.py)
+1. **Claim extraction** — split text into assertive claim-sized sentences.
+2. **Embed** with `sentence-transformers/all-MiniLM-L6-v2`.
+3. **Query ChromaDB** (local file-based vector store, seeded with 10 canonical truths on first run). Cosine threshold: 0.65.
+4. **Fallback to DuckDuckGo HTML** for claims the local store has no answer to.
+5. Each hit carries `engine` (`chroma` or `duckduckgo`) and `relevance`.
+
+### 3. OpenCV vision layer — [`utils/vision.py`](utils/vision.py)
+
+For image and video inputs:
+- **Lighting consistency** — LAB colour-cast comparison between image centre and border.
+- **JPEG blockiness** — 8-pixel boundary discontinuity analysis.
+- **Edge density** — Canny edge fraction (over-smoothed = suspicious).
+- **Inter-frame variance** for video — rapid luminance changes can indicate splicing.
+
+### 4. Optional LLM augmentation — [`utils/llm.py`](utils/llm.py)
 
 - Reads the key with `os.getenv("OPENAI_API_KEY")` at every call — never from any project file.
 - Adds per-claim neutral summaries and creative-leap detection.
-- Every call is wrapped in silent-failure guards so a quota or network error **never** blocks the dashboard.
+- **Every call is evidence-tracked** — model name, response id, latency, tokens in/out. Surfaced in the **🔬 LLM call evidence** expander.
 - A 60-second cached health probe distinguishes the three states shown above.
+
+### 5. FastAPI backend — [`api.py`](api.py)
+
+| Method | Endpoint          | Purpose                                                |
+|--------|-------------------|--------------------------------------------------------|
+| GET    | `/`               | Tiny landing page                                      |
+| GET    | `/health`         | JSON probe (heuristics, RAG, vision, LLM)              |
+| POST   | `/analyze`        | Text / URL analyze, with `use_rag` and `enrich_with_llm` flags |
+| POST   | `/analyze/upload` | Multipart upload for image / video / audio             |
+| GET    | `/docs`           | Auto-generated Swagger UI                              |
 
 ---
 
@@ -118,19 +160,27 @@ OmniGuard runs **two complementary pipelines**:
 ```
 OmniGuard AI/
 ├── app.py                       # Streamlit dashboard (UI + orchestration)
+├── api.py                       # FastAPI backend exposing /analyze
 ├── components/                  # Reserved for reusable UI components
-│   └── __init__.py
 ├── utils/
-│   ├── __init__.py
 │   ├── verifier.py              # Heuristic analysis pipeline
-│   └── llm.py                   # Optional OpenAI augmentation
+│   ├── llm.py                   # Optional OpenAI augmentation + health probe
+│   ├── rag.py                   # RAG cross-reference (Chroma + DuckDuckGo)
+│   ├── vision.py                # OpenCV forensic vision layer
+│   └── video.py                 # yt-dlp video downloader
+├── data/
+│   └── chroma/                  # Local ChromaDB vector store (auto-created)
 ├── test_app_e2e.py              # End-to-end AppTest suite
 ├── test_relevance.py            # Cross-reference regression tests
-├── requirements.txt
-├── setup_env.bat                # Windows venv + dependency installer
-├── setup_env.sh                 # Linux / macOS venv + dependency installer
+├── test_no_fabrication.py       # "man went to the moon" regression test
+├── test_full_stack.py           # RAG + vision + API + latency suite
+├── smoke_rag.py                 # One-shot RAG health probe
+├── smoke_vision.py              # One-shot OpenCV health probe
+├── smoke_api.py                 # One-shot FastAPI smoke test
+├── requirements.txt             # Lightweight install
+├── requirements-full.txt        # Full-stack install
+├── setup_env.bat / .sh          # venv + dependency installer
 ├── .env.example                 # Template (no real keys, ever)
-├── .gitignore                   # Excludes .venv, .env, secrets
 └── README.md                    # ← you are here
 ```
 
@@ -138,39 +188,57 @@ OmniGuard AI/
 
 ## 🧪 Testing
 
-The project ships with two test suites:
+The project ships with **four** test suites:
 
 ```bash
-# End-to-end UI test - drives the real app via AppTest
-# and exercises all three content-type paths
+# 1. End-to-end UI test - drives the real app via AppTest
 .\.venv\Scripts\python.exe test_app_e2e.py
 
-# Regression test for the cross-reference engine
-# (word-boundary matching, relevance scoring, main-content extraction)
+# 2. Cross-reference regression suite (word boundaries, relevance)
 .\.venv\Scripts\python.exe test_relevance.py
+
+# 3. No-fabrication regression test
+.\.venv\Scripts\python.exe test_no_fabrication.py
+
+# 4. Full-stack suite (RAG, OpenCV, FastAPI, latency)
+.\.venv\Scripts\python.exe test_full_stack.py
 ```
 
-Both should print `All scenarios passed.` / `All regression tests passed.` when the system is healthy.
+Plus one-shot smoke probes for quick debugging:
+
+```bash
+.\.venv\Scripts\python.exe smoke_rag.py      # RAG end-to-end
+.\.venv\Scripts\python.exe smoke_vision.py   # OpenCV forensic pass
+.\.venv\Scripts\python.exe smoke_api.py      # FastAPI endpoints
+```
+
+All should print `All ... tests passed.`
 
 ---
 
 ## 🛠️ Tech stack
 
-- **Python 3.10+** (developed and verified on 3.14)
-- **[Streamlit](https://streamlit.io/)** — UI framework
-- **[Plotly](https://plotly.com/python/)** — donut chart, future visualisations
-- **[Requests](https://requests.readthedocs.io/)** + **[BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/)** — URL fetching & parsing
-- **[OpenAI SDK](https://github.com/openai/openai-python)** (optional) — LLM augmentation
-- **[python-dotenv](https://pypi.org/project/python-dotenv/)** — `.env` loading (no secrets stored in repo)
+| Layer        | Tech                                                                                  |
+|--------------|---------------------------------------------------------------------------------------|
+| Frontend     | [Streamlit](https://streamlit.io/), [Plotly](https://plotly.com/python/)               |
+| Backend      | [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/)         |
+| RAG          | [ChromaDB](https://www.trychroma.com/), [sentence-transformers](https://www.sbert.net/), [DuckDuckGo Search](https://pypi.org/project/duckduckgo-search/) |
+| Vision       | [OpenCV](https://opencv.org/), [NumPy](https://numpy.org/)                             |
+| Video        | [yt-dlp](https://github.com/yt-dlp/yt-dlp)                                            |
+| Web fetching | [Requests](https://requests.readthedocs.io/), [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) |
+| LLM          | [OpenAI Python SDK](https://github.com/openai/openai-python) (GPT-4o-mini by default)  |
+| Testing      | [AppTest](https://docs.streamlit.io/library/api-reference/app-testing), [pytest]-style |
+| Config       | [python-dotenv](https://pypi.org/project/python-dotenv/)                              |
 
 ---
 
 ## 📋 Design constraints
 
-- **8 GB RAM target** — no PIL, no ffmpeg, no opencv, no torch.
-- **No secrets in the repo** — `.env` is in `.gitignore`; `.env.example` is the only template file. The OpenAI SDK is imported lazily.
+- **No secrets in the repo** — `.env` is in `.gitignore`; `.env.example` is the only template file. The OpenAI SDK is imported lazily and reads the key from `os.getenv` at call time.
+- **Lazy heavy imports** — OpenCV, Chroma, sentence-transformers, yt-dlp, and torch are imported inside the functions that need them. The dashboard still boots in seconds even with the full stack installed.
 - **Heuristic-first** — every LLM call has a silent-failure guard. The dashboard always renders, with or without a working API.
-- **Explainable heuristics** — every score is built from inspectable measurements (TTR, entropy, magic bytes, container format, etc.), not black-box predictions.
+- **Explainable heuristics** — every score is built from inspectable measurements (TTR, entropy, magic bytes, container format, colour-cast diff, etc.), not black-box predictions.
+- **Bounded downloads** — yt-dlp caps each video at 80 MB / 60 seconds so the local copy never blows up disk space.
 
 ---
 
@@ -178,20 +246,19 @@ Both should print `All scenarios passed.` / `All regression tests passed.` when 
 
 Adding a new verification module is straightforward:
 
-1. Drop a new function in [`utils/verifier.py`](utils/verifier.py) that returns a dict shaped like the existing per-modality dicts (`multimodal` / `cross_reference_results` / `hallucination_report`).
-2. Add a new entry in `CONTENT_TYPE_OPTIONS` in [`app.py`](app.py) and a corresponding `_render_*_tab` (or a new branch in `main()`).
-3. Add a regression test in [`test_relevance.py`](test_relevance.py) or a new test file.
-
-The 8 GB RAM rule still applies: prefer header / byte-level signals over pixel / frame decoding.
+1. Drop a new function in the appropriate `utils/*.py` module that returns a dict shaped like the existing per-modality dicts.
+2. If it needs heavy deps, import them lazily and gate on `is_x_available()`.
+3. Add a regression test in a new `test_*.py` file or extend `test_full_stack.py`.
+4. Wire it into `app.py` and `api.py` symmetrically.
 
 ---
 
 ## 🤝 Contributing
 
 PRs welcome. Please:
-- Run both test suites before opening a PR
-- Avoid adding heavy dependencies (PIL, opencv, torch) — there are usually header / byte-level shortcuts
-- Never commit `.env` or any real API key
+- Run all four test suites before opening a PR.
+- Avoid adding hidden dependencies — list them in `requirements-full.txt` and import them lazily.
+- Never commit `.env` or any real API key.
 
 ---
 
@@ -201,12 +268,4 @@ MIT — see [`LICENSE`](LICENSE) (add this file before publishing if you want MI
 
 ---
 
-## 🙏 Acknowledgements
-
-- [Streamlit](https://streamlit.io/) for the dashboard framework
-- [OpenAI](https://openai.com/) for the optional LLM enrichment path
-- The wide community of LLM-detection researchers whose work informed the heuristic tell-tale list
-
----
-
-<sub>Built with ❤️ for people who want a second opinion on what they read online.</sub>
+<sub>Built with ❤️ for journalists, researchers, and anyone who wants a second opinion on what they read online.</sub>

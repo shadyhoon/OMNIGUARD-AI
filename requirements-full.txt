@@ -1,0 +1,18 @@
+streamlit>=1.40
+requests>=2.32
+beautifulsoup4>=4.12
+plotly>=5.24
+python-dotenv>=1.0
+openai>=1.40
+
+# Full-stack additions (per the OmniGuard AI spec). These are imported
+# lazily inside the modules that need them, so the dashboard still
+# boots in a few seconds even if some of them are not installed.
+opencv-python>=4.10
+yt-dlp>=2024.8
+chromadb>=0.5
+sentence-transformers>=3.0
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+duckduckgo-search>=6.1

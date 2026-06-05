@@ -11,6 +11,16 @@ venv/
 # Environment
 .env
 
+# Local data (Chroma vector store, yt-dlp temp downloads)
+data/
+*.chroma
+downloads/
+
+# Smoke artefacts
+smoke_*.png
+smoke_*.jpg
+smoke_*.mp4
+
 # IDE
 .vscode/
 .idea/
