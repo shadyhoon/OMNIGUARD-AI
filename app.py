@@ -10,7 +10,7 @@ Run with:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import os
 
@@ -21,7 +21,13 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from utils.verifier import analyze_content
-from utils.llm import is_llm_available, llm_enrich_report, probe_llm_health
+from utils.llm import (
+    is_llm_available,
+    llm_enrich_report,
+    probe_llm_health,
+    available_providers,
+    get_provider,
+)
 
 # Load .env at startup (no-op if file is absent or empty).
 load_dotenv()
@@ -222,7 +228,7 @@ def _inject_theme_css() -> None:
 # Backend mapping: UI toggle -> analyze_content() content_type
 # =====================================================================
 CONTENT_TYPE_OPTIONS: List[Tuple[str, str]] = [
-    ("🎬  Video Link", "url"),
+    ("🎬  Video Link", "video"),
     ("📰  Text Article", "text"),
     ("🧵  Social Media Thread", "text"),
 ]
@@ -255,6 +261,88 @@ def _run_analysis(
     on every widget interaction.
     """
     return analyze_content(content_type, user_input, use_rag=use_rag)
+
+
+def _run_video_analysis(
+    url: str, use_rag: bool
+) -> Dict[str, Any]:
+    """
+    Orchestrator for the 🎬 Video Link toggle.
+
+    1. Download a short clip via yt-dlp (bounded length + size).
+    2. Hand the local file to ``analyze_content('video', path)`` so
+       the OpenCV vision layer (lighting / edge / inter-frame
+       variance) actually runs on real frames.
+    3. Stash the video metadata (title, uploader, duration) in the
+       report's ``diagnostics`` so the UI can render it.
+    4. Always clean up the temp file - even on exception - so disk
+       doesn't fill up over many analyses.
+    """
+    from utils.video import download_video_clip, cleanup_download, is_ytdlp_available  # lazy
+
+    if not is_ytdlp_available():
+        return {
+            "veracity_score": 0,
+            "multimodal_consistency": {
+                "applicable": False,
+                "summary": (
+                    "yt-dlp is not installed. Run "
+                    "`pip install -r requirements-full.txt` to enable "
+                    "video downloads."
+                ),
+            },
+            "cross_reference_results": [],
+            "hallucination_report": [
+                "Video Link toggle is unavailable: yt-dlp missing."
+            ],
+            "content_type": "video",
+            "generated_at": "",
+            "analysis_duration_ms": 0,
+            "diagnostics": {},
+        }
+
+    dl = download_video_clip(url)
+    path = None
+    try:
+        if not dl.get("ok"):
+            return {
+                "veracity_score": 0,
+                "multimodal_consistency": {
+                    "applicable": False,
+                    "summary": f"Video download failed: {dl.get('error', 'unknown')}",
+                },
+                "cross_reference_results": [],
+                "hallucination_report": [
+                    f"Could not download video: {dl.get('error', 'unknown')}"
+                ],
+                "content_type": "video",
+                "generated_at": "",
+                "analysis_duration_ms": 0,
+                "diagnostics": {"video_download": dl},
+            }
+
+        path = dl["path"]
+        report = analyze_content("video", path, use_rag=use_rag)
+
+        # Stash yt-dlp metadata so the UI can surface it.
+        diag = report.get("diagnostics") or {}
+        diag["video_metadata"] = {
+            "title": dl.get("title", ""),
+            "uploader": dl.get("uploader", ""),
+            "duration_sec": dl.get("duration", 0),
+            "filesize_mb": dl.get("filesize_mb", 0),
+            "site": dl.get("site", ""),
+            "source_url": url,
+        }
+        report["diagnostics"] = diag
+        return report
+    finally:
+        # Always try to clean up; never let cleanup errors propagate.
+        try:
+            if path:
+                cleanup_download(path)
+        except Exception:
+            pass
 
 
 def _api_url() -> str:
@@ -592,7 +680,7 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
             expanded=False,
         ):
             st.caption(
-                "Each row below is a real OpenAI API request and the "
+                "Each row below is a real LLM API request and the "
                 "server's response. If a row shows an error, the "
                 "heuristic output above is still valid - the LLM "
                 "augmentation just didn't run for that step."
@@ -601,8 +689,10 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
             tokens_out = report.get("llm_tokens_out") or 0
             total_ms = report.get("llm_latency_ms_total") or 0
             model = report.get("llm_model") or "?"
+            provider = report.get("llm_provider") or "?"
             st.markdown(
-                f"**Model requested:** `{model}` · "
+                f"**Provider:** `{provider}` · "
+                f"**Model:** `{model}` · "
                 f"**Calls:** {len(attempted)} attempted, "
                 f"{len(successful)} succeeded · "
                 f"**Tokens:** {tokens_in} in / {tokens_out} out · "
@@ -634,19 +724,33 @@ def _render_llm_section(report: Dict[str, Any]) -> None:
 # Sidebar
 # =====================================================================
 @st.cache_data(show_spinner=False, ttl=60)
-def _llm_health_cached(_nonce: int = 0) -> Dict[str, Any]:
+def _llm_health_cached(_nonce: int = 0, _provider: Optional[str] = None) -> Dict[str, Any]:
     """
     Cached health probe. The result is memoised for 60 seconds so we
     don't hit OpenAI on every widget re-render. The Re-probe button
-    bumps ``_nonce`` to invalidate the cache.
+    bumps ``_nonce`` to invalidate the cache. ``_provider`` lets
+    the user force a specific backend (e.g. Gemini).
     """
-    return probe_llm_health()
+    return probe_llm_health(name=_provider)
+
+
+def _selected_provider_name() -> Optional[str]:
+    """
+    Return the provider name the user picked in the sidebar, or
+    ``None`` to let ``utils.llm`` auto-detect from env vars.
+    """
+    val = st.session_state.get("llm_provider_override")
+    if not val or val == "auto":
+        return None
+    return val
 
 
 def _render_sidebar() -> None:
     # Nonce stored in session_state; bumping it invalidates the cache.
     if "llm_probe_nonce" not in st.session_state:
         st.session_state["llm_probe_nonce"] = 0
+    if "llm_provider_override" not in st.session_state:
+        st.session_state["llm_provider_override"] = "auto"
 
     with st.sidebar:
         st.markdown("## 🛡️ OmniGuard AI")
@@ -655,15 +759,45 @@ def _render_sidebar() -> None:
         st.divider()
         st.markdown("### System status")
 
-        if not is_llm_available():
+        # LLM provider selector (auto-detect by default).
+        detected = available_providers()
+        provider_options = ["auto"] + detected
+        st.selectbox(
+            "LLM provider",
+            options=provider_options,
+            key="llm_provider_override",
+            help=(
+                "Auto picks the first provider with a valid key. "
+                "Pick a specific one to override. Set the corresponding "
+                "API key as a system env var (`OPENAI_API_KEY` or "
+                "`GEMINI_API_KEY`)."
+            ),
+        )
+        if st.session_state["llm_provider_override"] == "auto" and detected:
+            st.caption(f"Detected: `{detected[0]}`")
+        elif st.session_state["llm_provider_override"] != "auto":
+            st.caption(f"Forced: `{st.session_state['llm_provider_override']}`")
+
+        chosen = _selected_provider_name()
+        llm_ok = is_llm_available() if chosen is None else get_provider(chosen) is not None
+        if not llm_ok:
+            needed = chosen or "OPENAI_API_KEY or GEMINI_API_KEY"
             st.warning(
-                "LLM augmentation: **offline**\n\n"
-                "Set `OPENAI_API_KEY` as a system env var to enable it."
+                f"LLM augmentation: **offline**\n\n"
+                f"Set `{needed}` as a system env var to enable it."
             )
         else:
-            health = _llm_health_cached(_nonce=st.session_state["llm_probe_nonce"])
+            health = _llm_health_cached(
+                _nonce=st.session_state["llm_probe_nonce"],
+                _provider=chosen,
+            )
             if health.get("ok"):
-                st.success("LLM augmentation: **online** (probe OK)")
+                prov = health.get("provider") or "?"
+                model = health.get("model") or "?"
+                st.success(
+                    f"LLM augmentation: **online** (probe OK)\n\n"
+                    f"Provider: `{prov}` · Model: `{model}`"
+                )
             else:
                 reason = health.get("reason", "unknown")
                 st.error(
@@ -675,7 +809,7 @@ def _render_sidebar() -> None:
             if st.button(
                 "🔄 Re-probe LLM",
                 use_container_width=True,
-                help="Re-check the OpenAI endpoint (60s cache).",
+                help="Re-check the LLM endpoint (60s cache).",
                 key="probe_llm_btn",
             ):
                 st.session_state["llm_probe_nonce"] += 1
@@ -775,10 +909,11 @@ def main() -> None:
         with opt_r:
             use_api = st.checkbox(
                 "Call FastAPI backend",
-                value=False,
+                value=True,
                 help=(
-                    "If checked, the request is sent to the FastAPI "
-                    "backend instead of running the pipeline in-process. "
+                    "Sends the request to the FastAPI backend instead of "
+                    "running the pipeline in-process. Falls back to the "
+                    "local pipeline automatically if the API is unreachable. "
                     f"Default URL: {_api_url()}"
                 ),
                 key="use_api",
@@ -812,27 +947,50 @@ def main() -> None:
         return
 
     # Map the chosen content-type to the backend content_type arg
-    backend_type = "url" if chosen_type == "url" else "text"
+    backend_type = chosen_type  # "video" | "url" | "text"
 
     use_rag = bool(st.session_state.get("use_rag", False))
     use_api = bool(st.session_state.get("use_api", False))
+    provider_name = _selected_provider_name()
+    enrich_ok = (provider_name is None and is_llm_available()) or (
+        provider_name is not None and get_provider(provider_name) is not None
+    )
 
     with st.spinner("🛡️ OmniGuard is analysing the content..."):
-        if use_api:
+        if backend_type == "video":
+            # Video Link: download via yt-dlp, then run the OpenCV
+            # vision pass on the actual frames. The orchestrator
+            # cleans up the temp file on the way out.
+            if use_api:
+                # Server-side download (lets the FastAPI worker do it).
+                report = _run_via_api(
+                    "video",
+                    user_input.strip(),
+                    use_rag=use_rag,
+                    enrich_with_llm=enrich_ok,
+                )
+            else:
+                report = _run_video_analysis(user_input.strip(), use_rag=use_rag)
+                if enrich_ok:
+                    try:
+                        report = llm_enrich_report(report, provider_name=provider_name)
+                    except Exception:
+                        pass
+        elif use_api:
             report = _run_via_api(
                 backend_type,
                 user_input.strip(),
                 use_rag=use_rag,
-                enrich_with_llm=is_llm_available(),
+                enrich_with_llm=enrich_ok,
             )
         else:
             report = _run_analysis(backend_type, user_input.strip(), use_rag=use_rag)
             # Carry the raw text through so the LLM augmentation can use it
             if backend_type == "text":
                 report["_raw_text"] = user_input
-            if is_llm_available():
+            if enrich_ok:
                 try:
-                    report = llm_enrich_report(report)
+                    report = llm_enrich_report(report, provider_name=provider_name)
                 except Exception:
                     # Never let an LLM error block the heuristic output.
                     pass

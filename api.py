@@ -48,7 +48,7 @@ app = FastAPI(
 # Request / response models
 # ---------------------------------------------------------------------
 class AnalyzeRequest(BaseModel):
-    content_type: str = Field(..., pattern="^(text|url)$")
+    content_type: str = Field(..., pattern="^(text|url|video)$")
     user_input: str = Field(..., min_length=1)
     use_rag: bool = False
     enrich_with_llm: bool = True
@@ -98,16 +98,52 @@ def analyze(req: AnalyzeRequest) -> JSONResponse:
     is true and the OpenAI key is set, the report is augmented
     with LLM summaries and the per-call evidence ledger.
     """
-    if req.content_type not in ("text", "url"):
-        raise HTTPException(status_code=400, detail="content_type must be 'text' or 'url'")
+    if req.content_type not in ("text", "url", "video"):
+        raise HTTPException(
+            status_code=400,
+            detail="content_type must be 'text', 'url' or 'video'",
+        )
     if not req.user_input.strip():
         raise HTTPException(status_code=400, detail="user_input must not be empty")
 
-    report = analyze_content(
-        req.content_type,
-        req.user_input.strip(),
-        use_rag=req.use_rag,
-    )
+    if req.content_type == "video":
+        # Server-side download + OpenCV vision pass.
+        from utils.video import download_video_clip, cleanup_download, is_ytdlp_available
+
+        if not is_ytdlp_available():
+            raise HTTPException(
+                status_code=501,
+                detail="yt-dlp not installed on the server",
+            )
+        dl = download_video_clip(req.user_input.strip())
+        if not dl.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"video download failed: {dl.get('error', 'unknown')}",
+            )
+        try:
+            report = analyze_content("video", dl["path"], use_rag=req.use_rag)
+            diag = report.get("diagnostics") or {}
+            diag["video_metadata"] = {
+                "title": dl.get("title", ""),
+                "uploader": dl.get("uploader", ""),
+                "duration_sec": dl.get("duration", 0),
+                "filesize_mb": dl.get("filesize_mb", 0),
+                "site": dl.get("site", ""),
+                "source_url": req.user_input.strip(),
+            }
+            report["diagnostics"] = diag
+        finally:
+            try:
+                cleanup_download(dl["path"])
+            except Exception:
+                pass
+    else:
+        report = analyze_content(
+            req.content_type,
+            req.user_input.strip(),
+            use_rag=req.use_rag,
+        )
     if req.enrich_with_llm and is_llm_available():
         try:
             if req.content_type == "text":

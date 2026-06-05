@@ -542,6 +542,44 @@ def _audio_forensics(data: bytes, path: str) -> Dict[str, Any]:
 # =====================================================================
 # Web / URL analysis
 # =====================================================================
+def _extract_meta_text(soup: BeautifulSoup) -> str:
+    """
+    Fall back to OpenGraph / Twitter / standard meta tags when the
+    body of the document is JS-rendered and yields no extractable
+    text. YouTube, Twitter, Instagram, and TikTok all populate these
+    tags in the static HTML even when the body is empty.
+
+    Returns a lowercased string. Empty if no meta tags are present.
+    """
+    parts: List[str] = []
+
+    def _meta(prop: str) -> str:
+        tag = soup.find("meta", attrs={"property": prop})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+        tag = soup.find("meta", attrs={"name": prop})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+        return ""
+
+    for prop in (
+        "og:title",
+        "og:description",
+        "og:site_name",
+        "twitter:title",
+        "twitter:description",
+        "description",
+    ):
+        v = _meta(prop)
+        if v:
+            parts.append(v)
+
+    if soup.title and soup.title.string:
+        parts.append(soup.title.string.strip())
+
+    return " ".join(parts).lower()
+
+
 def _extract_main_text(soup: BeautifulSoup) -> str:
     """
     Extract the *main* content of an HTML document, dropping nav,
@@ -550,7 +588,8 @@ def _extract_main_text(soup: BeautifulSoup) -> str:
       1. ``<article>`` blocks joined together (most blogs/news)
       2. ``<main>`` block
       3. The largest text density in any single ``<div>`` / ``<section>``
-      4. The whole document as a last resort
+      4. OpenGraph / meta-tag fallback for JS-rendered pages
+      5. The whole document as a last resort
 
     Returns a lowercased string suitable for keyword matching.
     """
@@ -585,7 +624,12 @@ def _extract_main_text(soup: BeautifulSoup) -> str:
     if best_score > 200:
         return best_text.lower()
 
-    # 4. Fallback: whole document. The caller will down-weight hits
+    # 4. Meta-tag fallback for JS-rendered pages.
+    meta = _extract_meta_text(soup)
+    if meta and len(meta) > 80:
+        return meta
+
+    # 5. Fallback: whole document. The caller will down-weight hits
     #    that come from this branch by checking total length.
     return soup.get_text(separator=" ", strip=True).lower()
 
