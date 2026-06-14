@@ -264,7 +264,7 @@ PRs welcome. Please:
 
 ## 📄 License
 
-MIT — see [`LICENSE`](LICENSE) (add this file before publishing if you want MIT).
+MIT — see [`LICENSE`](LICENSE)
 
 ---
 
